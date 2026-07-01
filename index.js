@@ -4,8 +4,26 @@ const { Server } = require('socket.io');
 
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+// Only the desktop app (Electron, served from file://) should reach the
+// signaling server. Blocking browser origins stops any random web page from
+// scripting socket.io-client to brute-force / enumerate session codes.
+function isAllowedOrigin(origin) {
+  // Native app requests have no Origin header (undefined) or a non-web scheme.
+  if (!origin || origin === 'null') return true;
+  return /^(file|app):\/\//.test(origin);
+}
+
+const io = new Server(server, {
+  // allowRequest HARD-rejects the handshake (HTTP 403) for disallowed origins.
+  // Unlike the `cors` option — which only sets response headers that solely a
+  // browser's XHR layer honors — this also blocks WebSocket upgrades and any
+  // non-browser client, which is what actually stops abuse of the signaling
+  // server from a malicious web page or bot.
+  allowRequest: (req, cb) => cb(null, isAllowedOrigin(req.headers.origin)),
+  cors: {
+    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
+    methods: ['GET', 'POST'],
+  },
 });
 
 // sessionId -> { hostId, viewerId, pendingViewerId, createdAt }
@@ -44,6 +62,10 @@ setInterval(() => {
       sessions.delete(id);
       io.to(s.hostId).emit('session-expired');
     }
+  }
+  // Prune stale rate-limit entries so the Map can't grow unbounded (slow DoS)
+  for (const [ip, entry] of ipAttempts.entries()) {
+    if (now - entry.windowStart > RATE_WINDOW) ipAttempts.delete(ip);
   }
 }, 60_000);
 
