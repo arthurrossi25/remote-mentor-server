@@ -12,22 +12,28 @@ const io     = new Server(server, {
 const sessions = new Map();
 
 // ===== RATE LIMITING =====
-// ip -> { count, windowStart }
-const joinAttempts = new Map();
-const RATE_WINDOW  = 60_000; // 1 minuto
-const RATE_MAX     = 8;      // máximo 8 tentativas por minuto por IP
+// ip -> { joinCount, createCount, windowStart }
+const ipAttempts  = new Map();
+const RATE_WINDOW = 60_000;
+const JOIN_MAX    = 8;   // [A2] join attempts per minute per IP
+const CREATE_MAX  = 5;   // [A2] create-session per minute per IP
+const SIGNAL_MAX_BYTES = 65_536; // [B1] 64 KB signal payload limit
 
-function isRateLimited(ip) {
+function checkRate(ip, field, max) {
   const now   = Date.now();
-  const entry = joinAttempts.get(ip) || { count: 0, windowStart: now };
+  const entry = ipAttempts.get(ip) || { joinCount: 0, createCount: 0, windowStart: now };
   if (now - entry.windowStart > RATE_WINDOW) {
-    entry.count       = 0;
+    entry.joinCount   = 0;
+    entry.createCount = 0;
     entry.windowStart = now;
   }
-  entry.count++;
-  joinAttempts.set(ip, entry);
-  return entry.count > RATE_MAX;
+  entry[field]++;
+  ipAttempts.set(ip, entry);
+  return entry[field] > max;
 }
+
+function isJoinLimited(ip)   { return checkRate(ip, 'joinCount',   JOIN_MAX);   }
+function isCreateLimited(ip) { return checkRate(ip, 'createCount', CREATE_MAX); }
 
 // ===== SESSION EXPIRY (60 min sem viewer conectado) =====
 const SESSION_TTL = 60 * 60_000;
@@ -47,9 +53,13 @@ io.on('connection', (socket) => {
   const ip = (socket.handshake.headers['x-forwarded-for'] || socket.handshake.address || '').split(',')[0].trim();
 
   socket.on('create-session', (sessionId) => {
-    // Validação de formato
     if (typeof sessionId !== 'string' || !/^\d{6}$/.test(sessionId)) {
       socket.emit('session-error', 'ID inválido');
+      return;
+    }
+    // [A2] Rate limit create-session per IP
+    if (isCreateLimited(ip)) {
+      socket.emit('session-error', 'Muitas sessões criadas. Aguarde 1 minuto.');
       return;
     }
     if (sessions.has(sessionId)) {
@@ -68,7 +78,7 @@ io.on('connection', (socket) => {
       return;
     }
     // Rate limiting
-    if (isRateLimited(ip)) {
+    if (isJoinLimited(ip)) {
       socket.emit('session-error', 'Muitas tentativas. Aguarde 1 minuto.');
       return;
     }
@@ -111,6 +121,20 @@ io.on('connection', (socket) => {
 
   socket.on('signal', ({ targetId, signal }) => {
     if (typeof targetId !== 'string') return;
+    // [B1] Limit signal payload size
+    try {
+      if (JSON.stringify(signal).length > SIGNAL_MAX_BYTES) return;
+    } catch { return; }
+    // [A1] Only relay between participants of the same session
+    let authorized = false;
+    for (const s of sessions.values()) {
+      const hostToViewer = s.hostId === socket.id &&
+        (s.viewerId === targetId || s.pendingViewerId === targetId);
+      const viewerToHost = s.hostId === targetId &&
+        (s.viewerId === socket.id || s.pendingViewerId === socket.id);
+      if (hostToViewer || viewerToHost) { authorized = true; break; }
+    }
+    if (!authorized) return;
     io.to(targetId).emit('signal', { fromId: socket.id, signal });
   });
 
